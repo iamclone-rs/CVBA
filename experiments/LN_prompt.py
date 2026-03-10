@@ -88,7 +88,7 @@ if __name__ == '__main__':
 
     trainer = Trainer(**_build_trainer_kwargs(logger, checkpoint_callback, ckpt_path))
 
-    model = Model()
+    model = Model(sorted(train_dataset.all_categories))
 
     print ('beginning training...good luck...')
     fit_params = inspect.signature(Trainer.fit).parameters

@@ -17,12 +17,14 @@ def freeze_all_but_bn(m):
 
 
 class Model(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, class_names=None):
         super().__init__()
 
         self.opts = opts
         self.clip, _ = clip.load('ViT-B/32', device=self.device)
         self.clip.apply(freeze_all_but_bn)
+        self.cls_loss_weight = self.opts.cls_loss_weight
+        self.class_names = sorted(class_names) if class_names is not None else []
 
         # Prompt Engineering
         self.sk_prompt = nn.Parameter(torch.randn(self.opts.n_prompts, self.opts.prompt_dim))
@@ -34,6 +36,12 @@ class Model(pl.LightningModule):
 
         self.best_metric = -1.0
         self.validation_step_outputs = []
+        if self.cls_loss_weight > 0:
+            self.category_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
+            self.register_buffer('class_text_features', self._build_class_text_features(), persistent=False)
+        else:
+            self.category_to_idx = {}
+            self.class_text_features = None
 
     def configure_optimizers(self):
         clip_trainable_params = [param for param in self.clip.parameters() if param.requires_grad]
@@ -41,6 +49,25 @@ class Model(pl.LightningModule):
             {'params': clip_trainable_params, 'lr': self.opts.clip_LN_lr},
             {'params': [self.sk_prompt] + [self.img_prompt], 'lr': self.opts.prompt_lr}])
         return optimizer
+
+    def _build_class_text_features(self):
+        prompts = ['a photo of a {}'.format(name.replace('_', ' ')) for name in self.class_names]
+        text_tokens = clip.tokenize(prompts)
+        with torch.no_grad():
+            text_features = self.clip.encode_text(text_tokens)
+        return F.normalize(text_features.float(), dim=-1)
+
+    def _classification_loss(self, feat, categories):
+        image_features = F.normalize(feat.float(), dim=-1)
+        text_features = self.class_text_features.float()
+        logit_scale = self.clip.logit_scale.exp().float()
+        logits = logit_scale * image_features @ text_features.t()
+        targets = torch.tensor(
+            [self.category_to_idx[category] for category in categories],
+            device=logits.device,
+            dtype=torch.long
+        )
+        return F.cross_entropy(logits, targets)
 
     def forward(self, data, dtype='image'):
         if dtype == 'image':
@@ -57,8 +84,16 @@ class Model(pl.LightningModule):
         sk_feat = self.forward(sk_tensor, dtype='sketch')
         neg_feat = self.forward(neg_tensor, dtype='image')
 
-        loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        self.log('train_triplet_loss', loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
+        loss = triplet_loss
+        if self.cls_loss_weight > 0:
+            sketch_cls_loss = self._classification_loss(sk_feat, _category)
+            photo_cls_loss = self._classification_loss(img_feat, _category)
+            loss = loss + self.cls_loss_weight * (sketch_cls_loss + photo_cls_loss)
+            self.log('train_sketch_cls_loss', sketch_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+            self.log('train_photo_cls_loss', photo_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+
+        self.log('train_triplet_loss', triplet_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         return loss
 
