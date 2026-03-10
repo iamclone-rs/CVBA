@@ -8,12 +8,12 @@ from src.clip import clip
 from experiments.options import opts
 
 
-def freeze_clip_except_visual_layernorms(model):
-    model.requires_grad_(False)
-    for module in model.visual.modules():
-        if isinstance(module, nn.LayerNorm):
-            for parameter in module.parameters():
-                parameter.requires_grad_(True)
+def freeze_all_but_bn(m):
+    if not isinstance(m, torch.nn.LayerNorm):
+        if hasattr(m, 'weight') and m.weight is not None:
+            m.weight.requires_grad_(False)
+        if hasattr(m, 'bias') and m.bias is not None:
+            m.bias.requires_grad_(False)
 
 class Model(pl.LightningModule):
     def __init__(self, class_names):
@@ -24,7 +24,7 @@ class Model(pl.LightningModule):
         self.class_names = sorted(class_names)
         self.category_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
         self.clip, _ = clip.load('ViT-B/32', device=self.device)
-        freeze_clip_except_visual_layernorms(self.clip)
+        self.clip.apply(freeze_all_but_bn)
 
         # Prompt Engineering
         self.sk_prompt = nn.Parameter(torch.randn(self.opts.n_prompts, self.opts.prompt_dim))
@@ -40,9 +40,9 @@ class Model(pl.LightningModule):
         self.register_buffer('class_text_features', self._build_class_text_features())
 
     def configure_optimizers(self):
-        visual_ln_params = [param for param in self.clip.visual.parameters() if param.requires_grad]
+        clip_trainable_params = [param for param in self.clip.parameters() if param.requires_grad]
         optimizer = torch.optim.Adam([
-            {'params': visual_ln_params, 'lr': self.opts.clip_LN_lr},
+            {'params': clip_trainable_params, 'lr': self.opts.clip_LN_lr},
             {'params': [self.sk_prompt] + [self.img_prompt], 'lr': self.opts.prompt_lr}])
         return optimizer
 
@@ -92,14 +92,17 @@ class Model(pl.LightningModule):
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        sketch_cls_loss = self._classification_loss(sk_feat, category)
-        photo_cls_loss = self._classification_loss(img_feat, category)
-        cls_loss = sketch_cls_loss + photo_cls_loss
-        loss = triplet_loss + self.cls_loss_weight * cls_loss
+        if self.cls_loss_weight > 0:
+            sketch_cls_loss = self._classification_loss(sk_feat, category)
+            photo_cls_loss = self._classification_loss(img_feat, category)
+            cls_loss = sketch_cls_loss + photo_cls_loss
+            loss = triplet_loss + self.cls_loss_weight * cls_loss
+            self.log('train_sketch_cls_loss', sketch_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+            self.log('train_photo_cls_loss', photo_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        else:
+            loss = triplet_loss
 
         self.log('train_triplet_loss', triplet_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-        self.log('train_sketch_cls_loss', sketch_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-        self.log('train_photo_cls_loss', photo_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         return loss
 
