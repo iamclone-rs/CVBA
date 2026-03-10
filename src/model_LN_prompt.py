@@ -16,13 +16,17 @@ def freeze_all_but_bn(m):
             m.bias.requires_grad_(False)
 
 class Model(pl.LightningModule):
-    def __init__(self, class_names):
+    def __init__(self, class_names=None):
         super().__init__()
-        self.save_hyperparameters({'class_names': list(class_names)})
 
         self.opts = opts
-        self.class_names = sorted(class_names)
+        self.cls_loss_weight = self.opts.cls_loss_weight
+        self.class_names = sorted(class_names) if class_names is not None else []
         self.category_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
+        self.save_hyperparameters({
+            'class_names': list(self.class_names),
+            'cls_loss_weight': self.cls_loss_weight
+        })
         self.clip, _ = clip.load('ViT-B/32', device=self.device)
         self.clip.apply(freeze_all_but_bn)
 
@@ -33,11 +37,13 @@ class Model(pl.LightningModule):
         self.distance_fn = lambda x, y: 1.0 - F.cosine_similarity(x, y)
         self.loss_fn = nn.TripletMarginWithDistanceLoss(
             distance_function=self.distance_fn, margin=0.2)
-        self.cls_loss_weight = self.opts.cls_loss_weight
 
         self.best_metric = -1e3
         self.validation_step_outputs = []
-        self.register_buffer('class_text_features', self._build_class_text_features())
+        if self.cls_loss_weight > 0:
+            self.register_buffer('class_text_features', self._build_class_text_features())
+        else:
+            self.class_text_features = None
 
     def configure_optimizers(self):
         clip_trainable_params = [param for param in self.clip.parameters() if param.requires_grad]

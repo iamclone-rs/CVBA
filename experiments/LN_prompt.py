@@ -88,7 +88,8 @@ if __name__ == '__main__':
 
     trainer = Trainer(**_build_trainer_kwargs(logger, checkpoint_callback, ckpt_path))
 
-    model = Model(sorted(train_dataset.all_categories))
+    class_names = sorted(train_dataset.all_categories) if opts.cls_loss_weight > 0 else None
+    model = Model(class_names)
 
     print ('beginning training...good luck...')
     fit_params = inspect.signature(Trainer.fit).parameters
