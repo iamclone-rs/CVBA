@@ -74,22 +74,21 @@ if __name__ == '__main__':
     logger = TensorBoardLogger('tb_logs', name=opts.exp_name)
 
     checkpoint_callback = ModelCheckpoint(
-        monitor='val_loss',
+        monitor='acc_1',
         dirpath='saved_models/%s'%opts.exp_name,
-        filename="{epoch:02d}-{val_loss:.4f}",
-        mode='min',
+        filename="{epoch:02d}-{acc_1:.2f}",
+        mode='max',
         save_last=True)
 
     ckpt_path = os.path.join('saved_models', opts.exp_name, 'last.ckpt')
-    if not os.path.exists(ckpt_path):
+    if not opts.resume or not os.path.exists(ckpt_path):
         ckpt_path = None
     else:
         print ('resuming training from %s'%ckpt_path)
 
     trainer = Trainer(**_build_trainer_kwargs(logger, checkpoint_callback, ckpt_path))
 
-    class_names = sorted(train_dataset.all_categories) if opts.cls_loss_weight > 0 else None
-    model = Model(class_names)
+    model = Model()
 
     print ('beginning training...good luck...')
     fit_params = inspect.signature(Trainer.fit).parameters

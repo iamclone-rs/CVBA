@@ -52,28 +52,58 @@ class Sketchy(torch.utils.data.Dataset):
                 self.all_categories = list(set(self.all_categories) - set(unseen_classes))
             else:
                 self.all_categories = unseen_classes
+        self.all_categories = sorted(self.all_categories)
 
         self.all_sketches_path = []
-        self.all_photos_path = {}
+        self.photo_path_by_category = {}
+        self.photo_ids_by_category = {}
 
         for category in self.all_categories:
-            self.all_sketches_path.extend(glob.glob(os.path.join(self.opts.data_dir, 'sketch', category, '*.png')))
-            self.all_photos_path[category] = glob.glob(os.path.join(self.opts.data_dir, 'photo', category, '*.jpg'))
+            photo_paths = []
+            for pattern in ('*.jpg', '*.jpeg', '*.png'):
+                photo_paths.extend(glob.glob(os.path.join(self.opts.data_dir, 'photo', category, pattern)))
+
+            photo_path_by_id = {
+                self._instance_id_from_photo(path): path for path in sorted(photo_paths)
+            }
+            self.photo_path_by_category[category] = photo_path_by_id
+            self.photo_ids_by_category[category] = sorted(photo_path_by_id.keys())
+
+            for sketch_path in sorted(glob.glob(os.path.join(self.opts.data_dir, 'sketch', category, '*.png'))):
+                instance_id = self._instance_id_from_sketch(os.path.basename(sketch_path))
+                if instance_id in photo_path_by_id:
+                    self.all_sketches_path.append(sketch_path)
 
     def __len__(self):
         return len(self.all_sketches_path)
+
+    @staticmethod
+    def _instance_id_from_sketch(filename):
+        return os.path.splitext(filename)[0].rsplit('-', 1)[0]
+
+    @staticmethod
+    def _instance_id_from_photo(filepath):
+        return os.path.splitext(os.path.basename(filepath))[0]
+
+    def _sample_negative_path(self, category, positive_instance_id):
+        negative_ids = [
+            photo_id for photo_id in self.photo_ids_by_category[category]
+            if photo_id != positive_instance_id
+        ]
+        if not negative_ids:
+            return self.photo_path_by_category[category][positive_instance_id]
+        negative_id = np.random.choice(negative_ids)
+        return self.photo_path_by_category[category][negative_id]
         
     def __getitem__(self, index):
         filepath = self.all_sketches_path[index]                
         category = filepath.split(os.path.sep)[-2]
         filename = os.path.basename(filepath)
-        
-        neg_classes = self.all_categories.copy()
-        neg_classes.remove(category)
+        instance_id = self._instance_id_from_sketch(filename)
 
         sk_path  = filepath
-        img_path = np.random.choice(self.all_photos_path[category])
-        neg_path = np.random.choice(self.all_photos_path[np.random.choice(neg_classes)])
+        img_path = self.photo_path_by_category[category][instance_id]
+        neg_path = self._sample_negative_path(category, instance_id)
 
         sk_data  = ImageOps.pad(Image.open(sk_path).convert('RGB'),  size=(self.opts.max_size, self.opts.max_size))
         img_data = ImageOps.pad(Image.open(img_path).convert('RGB'), size=(self.opts.max_size, self.opts.max_size))
@@ -84,10 +114,10 @@ class Sketchy(torch.utils.data.Dataset):
         neg_tensor = self.transform(neg_data)
         
         if self.return_orig:
-            return (sk_tensor, img_tensor, neg_tensor, category, filename,
+            return (sk_tensor, img_tensor, neg_tensor, category, instance_id,
                 sk_data, img_data, neg_data)
         else:
-            return (sk_tensor, img_tensor, neg_tensor, category, filename)
+            return (sk_tensor, img_tensor, neg_tensor, category, instance_id)
 
     @staticmethod
     def data_transform(opts):
@@ -110,7 +140,7 @@ if __name__ == '__main__':
     idx = 0
     for data in tqdm.tqdm(dataset_val):
         continue
-        (sk_tensor, img_tensor, neg_tensor, filename,
+        (sk_tensor, img_tensor, neg_tensor, category, instance_id,
             sk_data, img_data, neg_data) = data
 
         canvas = Image.new('RGB', (224*3, 224))

@@ -15,18 +15,12 @@ def freeze_all_but_bn(m):
         if hasattr(m, 'bias') and m.bias is not None:
             m.bias.requires_grad_(False)
 
+
 class Model(pl.LightningModule):
-    def __init__(self, class_names=None):
+    def __init__(self):
         super().__init__()
 
         self.opts = opts
-        self.cls_loss_weight = self.opts.cls_loss_weight
-        self.class_names = sorted(class_names) if class_names is not None else []
-        self.category_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
-        self.save_hyperparameters({
-            'class_names': list(self.class_names),
-            'cls_loss_weight': self.cls_loss_weight
-        })
         self.clip, _ = clip.load('ViT-B/32', device=self.device)
         self.clip.apply(freeze_all_but_bn)
 
@@ -38,12 +32,8 @@ class Model(pl.LightningModule):
         self.loss_fn = nn.TripletMarginWithDistanceLoss(
             distance_function=self.distance_fn, margin=0.2)
 
-        self.best_metric = -1e3
+        self.best_metric = -1.0
         self.validation_step_outputs = []
-        if self.cls_loss_weight > 0:
-            self.register_buffer('class_text_features', self._build_class_text_features())
-        else:
-            self.class_text_features = None
 
     def configure_optimizers(self):
         clip_trainable_params = [param for param in self.clip.parameters() if param.requires_grad]
@@ -51,36 +41,6 @@ class Model(pl.LightningModule):
             {'params': clip_trainable_params, 'lr': self.opts.clip_LN_lr},
             {'params': [self.sk_prompt] + [self.img_prompt], 'lr': self.opts.prompt_lr}])
         return optimizer
-
-    def _build_class_text_features(self):
-        prompts = [self._category_prompt(name) for name in self.class_names]
-        text_tokens = clip.tokenize(prompts)
-        with torch.no_grad():
-            text_features = self.clip.encode_text(text_tokens)
-        return F.normalize(text_features.float(), dim=-1)
-
-    @staticmethod
-    def _category_prompt(category_name):
-        readable_name = category_name.replace('_', ' ')
-        return 'a photo of a {}'.format(readable_name)
-
-    def _category_targets(self, categories):
-        return torch.tensor(
-            [self.category_to_idx[category] for category in categories],
-            device=self.device,
-            dtype=torch.long
-        )
-
-    def _classification_logits(self, feat):
-        image_features = F.normalize(feat.float(), dim=-1)
-        text_features = F.normalize(self.class_text_features.float(), dim=-1)
-        logit_scale = self.clip.logit_scale.exp().float()
-        return logit_scale * image_features @ text_features.t()
-
-    def _classification_loss(self, feat, categories):
-        logits = self._classification_logits(feat)
-        targets = self._category_targets(categories)
-        return F.cross_entropy(logits, targets)
 
     def forward(self, data, dtype='image'):
         if dtype == 'image':
@@ -92,95 +52,89 @@ class Model(pl.LightningModule):
         return feat
 
     def training_step(self, batch, batch_idx):
-        sk_tensor, img_tensor, neg_tensor, category = batch[:4]
-        img_feat = self.forward(img_tensor, dtype='image')
-        sk_feat = self.forward(sk_tensor, dtype='sketch')
-        neg_feat = self.forward(neg_tensor, dtype='image')
-
-        triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        if self.cls_loss_weight > 0:
-            sketch_cls_loss = self._classification_loss(sk_feat, category)
-            photo_cls_loss = self._classification_loss(img_feat, category)
-            cls_loss = sketch_cls_loss + photo_cls_loss
-            loss = triplet_loss + self.cls_loss_weight * cls_loss
-            self.log('train_sketch_cls_loss', sketch_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-            self.log('train_photo_cls_loss', photo_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-        else:
-            loss = triplet_loss
-
-        self.log('train_triplet_loss', triplet_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        sk_tensor, img_tensor, neg_tensor, category = batch[:4]
+        sk_tensor, img_tensor, neg_tensor, _category, _instance_id = batch
         img_feat = self.forward(img_tensor, dtype='image')
         sk_feat = self.forward(sk_tensor, dtype='sketch')
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        self.log('val_loss', loss)
+        self.log('train_triplet_loss', loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        sk_tensor, img_tensor, neg_tensor, category, instance_id = batch
+        img_feat = self.forward(img_tensor, dtype='image')
+        sk_feat = self.forward(sk_tensor, dtype='sketch')
+        neg_feat = self.forward(neg_tensor, dtype='image')
+
+        loss = self.loss_fn(sk_feat, img_feat, neg_feat)
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         self.validation_step_outputs.append((
             sk_feat.detach().cpu(),
             img_feat.detach().cpu(),
-            list(category)
+            list(category),
+            list(instance_id)
         ))
         return loss
 
     def on_validation_epoch_start(self):
         self.validation_step_outputs.clear()
 
-    @staticmethod
-    def _retrieval_metrics_at_k(scores, target, top_k):
-        top_k = min(top_k, scores.numel())
-        if top_k == 0:
-            zero = scores.new_tensor(0.0)
-            return zero, zero
-
-        top_indices = torch.argsort(scores, descending=True)[:top_k]
-        retrieved = target[top_indices].float()
-        precision_at_k = retrieved.mean()
-
-        total_relevant = int(target.sum().item())
-        if total_relevant == 0:
-            return scores.new_tensor(0.0), precision_at_k
-
-        positions = torch.arange(1, top_k + 1, dtype=torch.float32)
-        precision_curve = torch.cumsum(retrieved, dim=0) / positions
-        ap_at_k = (precision_curve * retrieved).sum() / min(total_relevant, top_k)
-        return ap_at_k, precision_at_k
-
     def on_validation_epoch_end(self):
         outputs = self.validation_step_outputs
-        Len = len(outputs)
-        if Len == 0:
+        if not outputs:
             return
-        query_feat_all = torch.cat([outputs[i][0] for i in range(Len)])
-        gallery_feat_all = torch.cat([outputs[i][1] for i in range(Len)])
-        all_category = np.array(sum([outputs[i][2] for i in range(Len)], []))
 
+        query_feat_all = torch.cat([item[0] for item in outputs])
+        gallery_feat_all = torch.cat([item[1] for item in outputs])
+        all_category = np.array(sum([item[2] for item in outputs], []))
+        all_instance_id = np.array(sum([item[3] for item in outputs], []))
 
-        ## Category-level SBIR Metrics at k=200
-        gallery = gallery_feat_all
-        ap_at_200 = torch.zeros(len(query_feat_all), dtype=torch.float32)
-        precision_at_200 = torch.zeros(len(query_feat_all), dtype=torch.float32)
-        for idx, sk_feat in enumerate(query_feat_all):
-            category = all_category[idx]
-            scores = -1 * self.distance_fn(sk_feat.unsqueeze(0), gallery)
-            target = torch.zeros(len(gallery), dtype=torch.bool)
-            target[np.where(all_category == category)] = True
-            ap_at_200[idx], precision_at_200[idx] = self._retrieval_metrics_at_k(scores, target, top_k=200)
+        gallery_by_key = {}
+        for feat, category, instance_id in zip(gallery_feat_all, all_category, all_instance_id):
+            key = (category, instance_id)
+            if key not in gallery_by_key:
+                gallery_by_key[key] = feat
 
-        mAP_200 = torch.mean(ap_at_200)
-        P_200 = torch.mean(precision_at_200)
-        self.log('mAP_200', mAP_200, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-        self.log('P_200', P_200, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        gallery_keys = list(gallery_by_key.keys())
+        gallery_feats = torch.stack([gallery_by_key[key] for key in gallery_keys])
+
+        correct_at_1 = 0
+        correct_at_5 = 0
+        for query_feat, category, target_instance_id in zip(query_feat_all, all_category, all_instance_id):
+            category_indices = [
+                idx for idx, (gallery_category, _) in enumerate(gallery_keys)
+                if gallery_category == category
+            ]
+            if not category_indices:
+                continue
+
+            category_gallery = gallery_feats[category_indices]
+            category_gallery_ids = [gallery_keys[idx][1] for idx in category_indices]
+            scores = -1 * self.distance_fn(query_feat.unsqueeze(0), category_gallery)
+            ranked_indices = torch.argsort(scores, descending=True)
+
+            if category_gallery_ids[ranked_indices[0].item()] == target_instance_id:
+                correct_at_1 += 1
+
+            top_k = min(5, len(category_gallery_ids))
+            top_ids = [category_gallery_ids[idx] for idx in ranked_indices[:top_k].tolist()]
+            if target_instance_id in top_ids:
+                correct_at_5 += 1
+
+        num_queries = max(1, len(query_feat_all))
+        acc_1 = 100.0 * correct_at_1 / num_queries
+        acc_5 = 100.0 * correct_at_5 / num_queries
+
+        self.log('acc_1', acc_1, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('acc_5', acc_5, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         if self.global_step > 0:
-            self.best_metric = self.best_metric if (self.best_metric > mAP_200.item()) else mAP_200.item()
+            self.best_metric = self.best_metric if (self.best_metric > acc_1) else acc_1
         if self.trainer.is_global_zero:
-            print('epoch {}: mAP@200={:.4f}, P@200={:.4f}, best mAP@200={:.4f}'.format(
+            print('epoch {}: Acc@1={:.2f}, Acc@5={:.2f}, best Acc@1={:.2f}'.format(
                 self.current_epoch + 1,
-                mAP_200.item(),
-                P_200.item(),
+                acc_1,
+                acc_5,
                 self.best_metric))
         self.validation_step_outputs.clear()
