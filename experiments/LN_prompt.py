@@ -32,9 +32,15 @@ def _build_trainer_kwargs(logger, checkpoint_callback, ckpt_path):
         max_epochs=2000,
         benchmark=True,
         logger=logger,
-        check_val_every_n_epoch=5,
+        check_val_every_n_epoch=1,
+        num_sanity_val_steps=0,
         callbacks=[checkpoint_callback]
     )
+
+    if 'enable_progress_bar' in trainer_init_params:
+        trainer_kwargs['enable_progress_bar'] = False
+    elif 'progress_bar_refresh_rate' in trainer_init_params:
+        trainer_kwargs['progress_bar_refresh_rate'] = 0
 
     if torch.cuda.is_available():
         if 'gpus' in trainer_init_params:

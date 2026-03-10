@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchmetrics.functional import retrieval_average_precision
 import pytorch_lightning as pl
 
 from src.clip import clip
@@ -80,6 +79,26 @@ class Model(pl.LightningModule):
     def on_validation_epoch_start(self):
         self.validation_step_outputs.clear()
 
+    @staticmethod
+    def _retrieval_metrics_at_k(scores, target, top_k):
+        top_k = min(top_k, scores.numel())
+        if top_k == 0:
+            zero = scores.new_tensor(0.0)
+            return zero, zero
+
+        top_indices = torch.argsort(scores, descending=True)[:top_k]
+        retrieved = target[top_indices].float()
+        precision_at_k = retrieved.mean()
+
+        total_relevant = int(target.sum().item())
+        if total_relevant == 0:
+            return scores.new_tensor(0.0), precision_at_k
+
+        positions = torch.arange(1, top_k + 1, dtype=torch.float32)
+        precision_curve = torch.cumsum(retrieved, dim=0) / positions
+        ap_at_k = (precision_curve * retrieved).sum() / min(total_relevant, top_k)
+        return ap_at_k, precision_at_k
+
     def on_validation_epoch_end(self):
         outputs = self.validation_step_outputs
         Len = len(outputs)
@@ -90,19 +109,27 @@ class Model(pl.LightningModule):
         all_category = np.array(sum([outputs[i][2] for i in range(Len)], []))
 
 
-        ## mAP category-level SBIR Metrics
+        ## Category-level SBIR Metrics at k=200
         gallery = gallery_feat_all
-        ap = torch.zeros(len(query_feat_all))
+        ap_at_200 = torch.zeros(len(query_feat_all), dtype=torch.float32)
+        precision_at_200 = torch.zeros(len(query_feat_all), dtype=torch.float32)
         for idx, sk_feat in enumerate(query_feat_all):
             category = all_category[idx]
-            distance = -1*self.distance_fn(sk_feat.unsqueeze(0), gallery)
+            scores = -1 * self.distance_fn(sk_feat.unsqueeze(0), gallery)
             target = torch.zeros(len(gallery), dtype=torch.bool)
             target[np.where(all_category == category)] = True
-            ap[idx] = retrieval_average_precision(distance.cpu(), target.cpu())
-        
-        mAP = torch.mean(ap)
-        self.log('mAP', mAP)
+            ap_at_200[idx], precision_at_200[idx] = self._retrieval_metrics_at_k(scores, target, top_k=200)
+
+        mAP_200 = torch.mean(ap_at_200)
+        P_200 = torch.mean(precision_at_200)
+        self.log('mAP_200', mAP_200, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('P_200', P_200, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         if self.global_step > 0:
-            self.best_metric = self.best_metric if  (self.best_metric > mAP.item()) else mAP.item()
-        print ('mAP: {}, Best mAP: {}'.format(mAP.item(), self.best_metric))
+            self.best_metric = self.best_metric if (self.best_metric > mAP_200.item()) else mAP_200.item()
+        if self.trainer.is_global_zero:
+            print('epoch {}: mAP@200={:.4f}, P@200={:.4f}, best mAP@200={:.4f}'.format(
+                self.current_epoch + 1,
+                mAP_200.item(),
+                P_200.item(),
+                self.best_metric))
         self.validation_step_outputs.clear()
