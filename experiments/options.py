@@ -22,6 +22,7 @@ parser.add_argument('--clip_lr', type=float, default=1e-4)
 parser.add_argument('--clip_LN_lr', type=float, default=1e-6)
 parser.add_argument('--prompt_lr', type=float, default=1e-4)
 parser.add_argument('--linear_lr', type=float, default=1e-4)
+parser.add_argument('--cls_loss_weight', type=float, default=0.5)
 parser.add_argument('--batch_size', type=int, default=192)
 parser.add_argument('--workers', type=int, default=128)
 

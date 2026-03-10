@@ -7,23 +7,24 @@ import pytorch_lightning as pl
 from src.clip import clip
 from experiments.options import opts
 
-def freeze_model(m):
-    m.requires_grad_(False)
 
-def freeze_all_but_bn(m):
-    if not isinstance(m, torch.nn.LayerNorm):
-        if hasattr(m, 'weight') and m.weight is not None:
-            m.weight.requires_grad_(False)
-        if hasattr(m, 'bias') and m.bias is not None:
-            m.bias.requires_grad_(False)
+def freeze_clip_except_visual_layernorms(model):
+    model.requires_grad_(False)
+    for module in model.visual.modules():
+        if isinstance(module, nn.LayerNorm):
+            for parameter in module.parameters():
+                parameter.requires_grad_(True)
 
 class Model(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, class_names):
         super().__init__()
+        self.save_hyperparameters({'class_names': list(class_names)})
 
         self.opts = opts
+        self.class_names = sorted(class_names)
+        self.category_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
         self.clip, _ = clip.load('ViT-B/32', device=self.device)
-        self.clip.apply(freeze_all_but_bn)
+        freeze_clip_except_visual_layernorms(self.clip)
 
         # Prompt Engineering
         self.sk_prompt = nn.Parameter(torch.randn(self.opts.n_prompts, self.opts.prompt_dim))
@@ -32,15 +33,48 @@ class Model(pl.LightningModule):
         self.distance_fn = lambda x, y: 1.0 - F.cosine_similarity(x, y)
         self.loss_fn = nn.TripletMarginWithDistanceLoss(
             distance_function=self.distance_fn, margin=0.2)
+        self.cls_loss_weight = self.opts.cls_loss_weight
 
         self.best_metric = -1e3
         self.validation_step_outputs = []
+        self.register_buffer('class_text_features', self._build_class_text_features())
 
     def configure_optimizers(self):
+        visual_ln_params = [param for param in self.clip.visual.parameters() if param.requires_grad]
         optimizer = torch.optim.Adam([
-            {'params': self.clip.parameters(), 'lr': self.opts.clip_LN_lr},
+            {'params': visual_ln_params, 'lr': self.opts.clip_LN_lr},
             {'params': [self.sk_prompt] + [self.img_prompt], 'lr': self.opts.prompt_lr}])
         return optimizer
+
+    def _build_class_text_features(self):
+        prompts = [self._category_prompt(name) for name in self.class_names]
+        text_tokens = clip.tokenize(prompts)
+        with torch.no_grad():
+            text_features = self.clip.encode_text(text_tokens)
+        return F.normalize(text_features.float(), dim=-1)
+
+    @staticmethod
+    def _category_prompt(category_name):
+        readable_name = category_name.replace('_', ' ')
+        return 'a photo of a {}'.format(readable_name)
+
+    def _category_targets(self, categories):
+        return torch.tensor(
+            [self.category_to_idx[category] for category in categories],
+            device=self.device,
+            dtype=torch.long
+        )
+
+    def _classification_logits(self, feat):
+        image_features = F.normalize(feat.float(), dim=-1)
+        text_features = F.normalize(self.class_text_features.float(), dim=-1)
+        logit_scale = self.clip.logit_scale.exp().float()
+        return logit_scale * image_features @ text_features.t()
+
+    def _classification_loss(self, feat, categories):
+        logits = self._classification_logits(feat)
+        targets = self._category_targets(categories)
+        return F.cross_entropy(logits, targets)
 
     def forward(self, data, dtype='image'):
         if dtype == 'image':
@@ -57,8 +91,16 @@ class Model(pl.LightningModule):
         sk_feat = self.forward(sk_tensor, dtype='sketch')
         neg_feat = self.forward(neg_tensor, dtype='image')
 
-        loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        self.log('train_loss', loss)
+        triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
+        sketch_cls_loss = self._classification_loss(sk_feat, category)
+        photo_cls_loss = self._classification_loss(img_feat, category)
+        cls_loss = sketch_cls_loss + photo_cls_loss
+        loss = triplet_loss + self.cls_loss_weight * cls_loss
+
+        self.log('train_triplet_loss', triplet_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_sketch_cls_loss', sketch_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_photo_cls_loss', photo_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
