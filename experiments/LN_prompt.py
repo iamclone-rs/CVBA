@@ -70,7 +70,7 @@ if __name__ == '__main__':
     checkpoint_callback = ModelCheckpoint(
         monitor='val_loss',
         dirpath='saved_models/%s'%opts.exp_name,
-        filename="{epoch:02d}-{top10:.2f}",
+        filename="{epoch:02d}-{val_loss:.4f}",
         mode='min',
         save_last=True)
 
