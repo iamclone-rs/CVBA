@@ -69,6 +69,29 @@ class Model(pl.LightningModule):
         )
         return F.cross_entropy(logits, targets)
 
+    def _hard_negative_features(self, sk_feat, img_feat, fallback_neg_feat, categories, instance_ids):
+        hard_negatives = []
+        num_hard_negatives = 0
+
+        for idx, (category, instance_id) in enumerate(zip(categories, instance_ids)):
+            candidate_indices = [
+                candidate_idx for candidate_idx, (candidate_category, candidate_instance_id) in enumerate(zip(categories, instance_ids))
+                if candidate_idx != idx and candidate_category == category and candidate_instance_id != instance_id
+            ]
+
+            if candidate_indices:
+                candidate_feats = img_feat[candidate_indices]
+                candidate_distances = self.distance_fn(sk_feat[idx].unsqueeze(0), candidate_feats)
+                hardest_negative_idx = candidate_indices[torch.argmin(candidate_distances).item()]
+                hard_negatives.append(img_feat[hardest_negative_idx])
+                num_hard_negatives += 1
+            else:
+                hard_negatives.append(fallback_neg_feat[idx])
+
+        hard_negative_feat = torch.stack(hard_negatives)
+        hard_negative_ratio = num_hard_negatives / max(1, len(categories))
+        return hard_negative_feat, hard_negative_ratio
+
     def forward(self, data, dtype='image'):
         if dtype == 'image':
             feat = self.clip.encode_image(
@@ -79,21 +102,24 @@ class Model(pl.LightningModule):
         return feat
 
     def training_step(self, batch, batch_idx):
-        sk_tensor, img_tensor, neg_tensor, _category, _instance_id = batch
+        sk_tensor, img_tensor, neg_tensor, category, instance_id = batch
         img_feat = self.forward(img_tensor, dtype='image')
         sk_feat = self.forward(sk_tensor, dtype='sketch')
         neg_feat = self.forward(neg_tensor, dtype='image')
+        hard_neg_feat, hard_negative_ratio = self._hard_negative_features(
+            sk_feat, img_feat, neg_feat, category, instance_id)
 
-        triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
+        triplet_loss = self.loss_fn(sk_feat, img_feat, hard_neg_feat)
         loss = triplet_loss
         if self.cls_loss_weight > 0:
-            sketch_cls_loss = self._classification_loss(sk_feat, _category)
-            photo_cls_loss = self._classification_loss(img_feat, _category)
+            sketch_cls_loss = self._classification_loss(sk_feat, category)
+            photo_cls_loss = self._classification_loss(img_feat, category)
             loss = loss + self.cls_loss_weight * (sketch_cls_loss + photo_cls_loss)
             self.log('train_sketch_cls_loss', sketch_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
             self.log('train_photo_cls_loss', photo_cls_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
         self.log('train_triplet_loss', triplet_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_hard_negative_ratio', hard_negative_ratio, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         return loss
 
@@ -102,9 +128,12 @@ class Model(pl.LightningModule):
         img_feat = self.forward(img_tensor, dtype='image')
         sk_feat = self.forward(sk_tensor, dtype='sketch')
         neg_feat = self.forward(neg_tensor, dtype='image')
+        hard_neg_feat, hard_negative_ratio = self._hard_negative_features(
+            sk_feat, img_feat, neg_feat, category, instance_id)
 
-        loss = self.loss_fn(sk_feat, img_feat, neg_feat)
+        loss = self.loss_fn(sk_feat, img_feat, hard_neg_feat)
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('val_hard_negative_ratio', hard_negative_ratio, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         self.validation_step_outputs.append((
             sk_feat.detach().cpu(),
             img_feat.detach().cpu(),
