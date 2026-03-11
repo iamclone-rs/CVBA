@@ -8,6 +8,7 @@ from src.clip import clip
 from experiments.options import opts
 
 
+
 def freeze_all_but_bn(m):
     if not isinstance(m, torch.nn.LayerNorm):
         if hasattr(m, 'weight') and m.weight is not None:

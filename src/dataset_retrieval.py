@@ -5,6 +5,7 @@ import torch
 from torchvision import transforms
 from PIL import Image, ImageOps
 
+
 unseen_classes = [
     "bat",
     "cabin",
